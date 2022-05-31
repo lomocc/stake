@@ -14,8 +14,10 @@ WORKDIR /app
 
 COPY . .
 
-EXPOSE 8545
+RUN brownie compile
 
 # ENV WEB3_INFURA_PROJECT_ID
+
+EXPOSE 8545
 
 CMD [ "./run.sh" ]
