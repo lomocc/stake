@@ -28,6 +28,6 @@ RUN brownie networks modify mainnet-fork accounts=100 port=8000
 
 # ENV WEB3_INFURA_PROJECT_ID
 
-EXPOSE 8545
+EXPOSE 80
 
 CMD ["sh","-c","nginx -g 'daemon off;' & ./run.sh"]
