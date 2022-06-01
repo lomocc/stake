@@ -6,16 +6,7 @@
 
 ### 2. Startup a new [geth](https://geth.ethereum.org/) node
 
-**python**:
-
-```sh
-pip install eth-brownie
-
-export WEB3_INFURA_PROJECT_ID=<Your Infura PROJECT ID>
-./run.sh
-```
-
-or run with **docker**
+run with **docker**
 
 ```sh
 export WEB3_INFURA_PROJECT_ID=<Your Infura PROJECT ID>
