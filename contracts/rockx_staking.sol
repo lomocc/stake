@@ -121,15 +121,14 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
     bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
     bytes32 public constant REGISTRY_ROLE = keccak256("REGISTRY_ROLE");
-    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    uint256 public constant DEPOSIT_SIZE = 32 ether;
 
     uint256 private constant MULTIPLIER = 1e18; 
     uint256 private constant DEPOSIT_AMOUNT_UNIT = 1000000000 wei;
     uint256 private constant SIGNATURE_LENGTH = 96;
     uint256 private constant PUBKEY_LENGTH = 48;
     
-    uint256 private DEPOSIT_SIZE;           // deposit_size adjustable via func
     address public ethDepositContract;      // ETH 2.0 Deposit contract
     address public xETHAddress;             // xETH token address
     address public redeemContract;          // redeeming contract for user to pull ethers
@@ -139,7 +138,7 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
     
     // credentials, pushed by owner
     ValidatorCredential [] private validatorRegistry;
-    mapping(bytes32 => bool) private pubkeyIndices;
+    mapping(bytes32 => uint256) private pubkeyIndices; // indices of validatorRegistry by pubkey hash, starts from 1
 
     // next validator id
     uint256 private nextValidatorId;
@@ -170,13 +169,12 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
     int256 private accountedBalance;                // tracked balance change in functions,
                                                     // NOTE(x): balance might be negative for not accounting validators's redeeming
 
-    uint256 private recentSlashed;                  // track recently slashed value
     uint256 private recentReceived;                 // track recently received (un-accounted) value into this contract
     bytes32 private vectorClock;                    // a vector clock for detecting receive() & pushBeacon() causality violations
     uint256 private vectorClockTicks;               // record current vector clock step;
 
     // track stopped validators
-    bytes [] private stoppedValidators;             // track stopped validator pubkey
+    uint256 stoppedValidators;                      // track stopped validators count
 
     // phase switch from 0 to 1
     uint256 private phase;
@@ -222,7 +220,6 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ORACLE_ROLE, msg.sender);
-        _grantRole(OPERATOR_ROLE, msg.sender);
         _grantRole(REGISTRY_ROLE, msg.sender);
         _grantRole(PAUSER_ROLE, msg.sender);
         _grantRole(MANAGER_ROLE, msg.sender);
@@ -232,16 +229,7 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         firstDebt = 1;
         lastDebt = 0;
         phase = 0;
-        DEPOSIT_SIZE = 32 ether;
         _vectorClockTick();
-    }
-
-    /**
-     * @dev adjust deposit_size
-     */
-    function setDepositSize(uint256 depositSize) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(depositSize > 0, "INVALID_DEPOSIT_SIZE");
-        DEPOSIT_SIZE = depositSize;
     }
 
     /**
@@ -260,29 +248,28 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         require(pubkey.length == PUBKEY_LENGTH, "INCONSISTENT_PUBKEY_LEN");
 
         bytes32 pubkeyHash = keccak256(pubkey);
-        require(!pubkeyIndices[pubkeyHash], "DUPLICATED_PUBKEY");
+        require(pubkeyIndices[pubkeyHash] == 0, "DUPLICATED_PUBKEY");
         validatorRegistry.push(ValidatorCredential({pubkey:pubkey, signature:signature, stopped:false}));
-        pubkeyIndices[pubkeyHash] = true;
+        pubkeyIndices[pubkeyHash] = validatorRegistry.length;
     }
 
     /**
      * @dev replace a validator in case of msitakes
      */
-    function replaceValidator(uint256 index, bytes calldata pubkey, bytes calldata signature) external onlyRole(REGISTRY_ROLE) {
-        require(index < validatorRegistry.length, "ID_OUT_OF_RANGE");
-        require(index < nextValidatorId, "VALIDATOR_ALREADY_ACTIVATED");
+    function replaceValidator(bytes calldata oldpubkey, bytes calldata pubkey, bytes calldata signature) external onlyRole(REGISTRY_ROLE) {
         require(pubkey.length == PUBKEY_LENGTH, "INCONSISTENT_PUBKEY_LEN");
         require(signature.length == SIGNATURE_LENGTH, "INCONSISTENT_SIG_LEN");
 
         // mark old pub key to false
-        bytes32 oldPubKeyHash = keccak256(validatorRegistry[index].pubkey);
-        pubkeyIndices[oldPubKeyHash] = false;
+        bytes32 oldPubKeyHash = keccak256(oldpubkey);
+        require(pubkeyIndices[oldPubKeyHash] == 0, "PUBKEY_NOT_EXSITS");
+        uint256 index = pubkeyIndices[oldPubKeyHash] - 1;
+        delete pubkeyIndices[oldPubKeyHash];
 
         // set new pubkey
         bytes32 pubkeyHash = keccak256(pubkey);
-        require(!pubkeyIndices[pubkeyHash], "DUPLICATED_PUBKEY");
         validatorRegistry[index] = ValidatorCredential({pubkey:pubkey, signature:signature, stopped:false});
-        pubkeyIndices[pubkeyHash] = true;
+        pubkeyIndices[pubkeyHash] = index+1;
     }
 
     /**
@@ -294,10 +281,11 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         for(uint256 i=0;i<n;i++) {
             require(pubkeys[i].length == PUBKEY_LENGTH, "INCONSISTENT_PUBKEY_LEN");
             require(signatures[i].length == SIGNATURE_LENGTH, "INCONSISTENT_SIG_LEN");
+
             bytes32 pubkeyHash = keccak256(pubkeys[i]);
-            require(!pubkeyIndices[pubkeyHash], "DUPLICATED_PUBKEY");
+            require(pubkeyIndices[pubkeyHash] == 0, "DUPLICATED_PUBKEY");
             validatorRegistry.push(ValidatorCredential({pubkey:pubkeys[i], signature:signatures[i], stopped:false}));
-            pubkeyIndices[pubkeyHash] = true;
+            pubkeyIndices[pubkeyHash] = validatorRegistry.length;
         }
     }
     
@@ -388,8 +376,7 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
     function pushBeacon(uint256 _aliveValidators, uint256 _aliveBalance, bytes32 clock) external onlyRole(ORACLE_ROLE) {
         require(vectorClock == clock, "CASUALITY_VIOLATION");
         require(int256(address(this).balance) == accountedBalance, "BALANCE_DEVIATES");
-        require(_aliveValidators + stoppedValidators.length <= nextValidatorId, "VALIDATOR_COUNT_MISMATCH");
-        require(_aliveBalance + uint256(recentReceived) + recentSlashed >= reportedValidatorBalance, "OVERALL_BALANCE_DECREASED");
+        require(_aliveValidators + stoppedValidators <= nextValidatorId, "VALIDATOR_COUNT_MISMATCH");
         require(_aliveBalance >= _aliveValidators * DEPOSIT_SIZE, "ALIVE_BALANCE_DECREASED");
 
         // step 1. check if new validator increased
@@ -405,17 +392,16 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         // either stopped validators or withdrawed ethers as rewards, 
         // revenue generated if:
         //  current alive balance + ethers from validators >= reward base
-        if (_aliveBalance + recentReceived + recentSlashed> rewardBase) {
-            uint256 rewards = _aliveBalance + recentReceived + recentSlashed - rewardBase;
-            _distributeRewards(rewards);
-        }
+        // make sure we have revenue
+        require(_aliveBalance + recentReceived > rewardBase, "NOT_ENOUGH_REVENUE");
+        uint256 rewards = _aliveBalance + recentReceived - rewardBase;
+        _distributeRewards(rewards);
 
         // step 3. update reportedValidators & reportedValidatorBalance
         // reset the recentReceived to 0
         reportedValidatorBalance = _aliveBalance; 
         reportedValidators = _aliveValidators;
         recentReceived = 0;
-        recentSlashed = 0;
 
         // step 4. vector clock moves, make sure never use the same vector again
         _vectorClockTick();
@@ -424,21 +410,22 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
     /**
      * @dev notify some validators stopped, and pay the debts
      */
-    function validatorStopped(uint256 [] calldata _stoppedIDs, uint256 _stoppedBalance) external nonReentrant onlyRole(ORACLE_ROLE) {
-        uint256 amountUnstaked = _stoppedIDs.length * DEPOSIT_SIZE;
-        require(_currentEthersReceived() >= _stoppedBalance, "INSUFFICIENT_ETHERS_PUSHED");
+    function validatorStopped(bytes [] calldata _stoppedPubKeys, uint256 _stoppedBalance) external nonReentrant onlyRole(ORACLE_ROLE) {
+        uint256 amountUnstaked = _stoppedPubKeys.length * DEPOSIT_SIZE;
+        require(_stoppedPubKeys.length > 0, "EMPTY_CALLDATA");
         require(_stoppedBalance >= amountUnstaked, "INSUFFICIENT_ETHERS_STOPPED");
-        require(_stoppedIDs.length > 0, "EMPTY_CALLDATA");
-        require(_stoppedIDs.length + stoppedValidators.length <= nextValidatorId, "REPORTED_MORE_STOPPED_VALIDATORS");
+        require(_stoppedPubKeys.length + stoppedValidators <= nextValidatorId, "REPORTED_MORE_STOPPED_VALIDATORS");
+        require(_currentEthersReceived() >= _stoppedBalance, "INSUFFICIENT_ETHERS_PUSHED");
 
         // record stopped validators snapshot.
-        for (uint i=0;i<_stoppedIDs.length;i++) {
-            require(_stoppedIDs[i] < nextValidatorId, "ID_OUT_OF_RANGE");
-            require(!validatorRegistry[_stoppedIDs[i]].stopped, "ID_ALREADY_STOPPED");
-
-            validatorRegistry[_stoppedIDs[i]].stopped = true;
-            stoppedValidators.push(validatorRegistry[_stoppedIDs[i]].pubkey);
+        for (uint i=0;i<_stoppedPubKeys.length;i++) {
+            bytes32 pubkeyHash = keccak256(_stoppedPubKeys[i]);
+            require(pubkeyIndices[pubkeyHash] > 0, "PUBKEY_NOT_EXIST");
+            uint256 index = pubkeyIndices[pubkeyHash] - 1;
+            require(!validatorRegistry[index].stopped, "ID_ALREADY_STOPPED");
+            validatorRegistry[index].stopped = true;
         }
+        stoppedValidators += _stoppedPubKeys.length;
 
         // NOTE(x) The following procedure MUST keep currentReserve unchanged:
         // 
@@ -473,38 +460,37 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         }
 
         // log
-        emit ValidatorStopped(_stoppedIDs, _stoppedBalance);
+        emit ValidatorStopped(_stoppedPubKeys.length, _stoppedBalance);
     }
 
     /**
      * @dev notify some validators has been slashed, turn off those stopped validator
      */
-    function validatorSlashedStop(uint256 [] calldata _stoppedIDs, uint256 _stoppedBalance) external nonReentrant onlyRole(ORACLE_ROLE) {
+    function validatorSlashedStop(bytes [] calldata _stoppedPubKeys, uint256 _stoppedBalance) external nonReentrant onlyRole(ORACLE_ROLE) {
+        uint256 amountUnstaked = _stoppedPubKeys.length * DEPOSIT_SIZE;
+        require(_stoppedPubKeys.length > 0, "EMPTY_CALLDATA");
+        require(_stoppedBalance < amountUnstaked, "STOPPED_BALANCE_NOT_SLASHED");
         require(_currentEthersReceived() >= _stoppedBalance, "INSUFFICIENT_ETHERS_PUSHED");
-        require(_stoppedIDs.length > 0, "EMPTY_CALLDATA");
-        require(_stoppedIDs.length + stoppedValidators.length <= nextValidatorId, "REPORTED_MORE_STOPPED_VALIDATORS");
 
         // record stopped validators snapshot.
-        for (uint i=0;i<_stoppedIDs.length;i++) {
-            require(_stoppedIDs[i] < nextValidatorId, "ID_OUT_OF_RANGE");
-            require(!validatorRegistry[_stoppedIDs[i]].stopped, "ID_ALREADY_STOPPED");
-
-            validatorRegistry[_stoppedIDs[i]].stopped = true;
-            stoppedValidators.push(validatorRegistry[_stoppedIDs[i]].pubkey);
+        for (uint i=0;i<_stoppedPubKeys.length;i++) {
+            bytes32 pubkeyHash = keccak256(_stoppedPubKeys[i]);
+            require(pubkeyIndices[pubkeyHash] > 0, "PUBKEY_NOT_EXIST");
+            uint256 index = pubkeyIndices[pubkeyHash] - 1;
+            require(!validatorRegistry[index].stopped, "ID_ALREADY_STOPPED");
+            validatorRegistry[index].stopped = true;
         }
+        stoppedValidators += _stoppedPubKeys.length;
+
 
         // here we restake the remaining ethers by putting to totalPending
-        uint256 amountUnstaked = _stoppedIDs.length * DEPOSIT_SIZE;
         totalPending += _stoppedBalance;
 
         // track total staked ethers
         totalStaked -= amountUnstaked;
 
-        // record recent slashed ethers
-        recentSlashed += amountUnstaked - _stoppedBalance;
-
         // log
-        emit ValidatorSlashedStopped(_stoppedIDs, _stoppedBalance);
+        emit ValidatorSlashedStopped(_stoppedPubKeys.length, _stoppedBalance);
     }
 
     /**
@@ -531,6 +517,11 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
      * @dev returns current accounted balance
      */
     function getAccountedBalance() external view returns(int256) { return accountedBalance; }
+
+    /**
+     * @dev return total staked ethers
+     */
+    function getTotalStaked() external view returns (uint256) { return totalStaked; }
 
     /**
      * @dev return pending ethers
@@ -594,9 +585,7 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
     /**
      * @dev return next validator id
      */
-    function getNextValidatorId() external view returns (uint256) {
-        return nextValidatorId;
-    }
+    function getNextValidatorId() external view returns (uint256) { return nextValidatorId; }
 
     /**
      * @dev return exchange ratio of , multiplied by 1e18
@@ -628,22 +617,7 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
     /**
      * @dev get stopped validators count
      */
-    function getStoppedValidatorsCount() external view returns (uint256) {
-        return stoppedValidators.length;
-    }
-    
-    /**
-     * @dev get stopped validators ID range
-     */
-    function getStoppedValidators(uint256 idx_from, uint256 idx_to) external view returns (bytes[] memory) {
-        bytes[] memory result = new bytes[](idx_to - idx_from);
-        uint counter = 0;
-        for (uint i = idx_from; i < idx_to;i++) {
-            result[counter] = stoppedValidators[i];
-            counter++;
-        }
-        return result;
-    }
+    function getStoppedValidatorsCount() external view returns (uint256) { return stoppedValidators; }
 
     /**
      * ======================================================================================
@@ -871,10 +845,10 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
      * ======================================================================================
      */
     event ValidatorActivated(uint256 node_id);
-    event ValidatorStopped(uint256 [] stoppedIDs, uint256 stoppedBalance);
+    event ValidatorStopped(uint256 stoppedCount, uint256 stoppedBalance);
     event RevenueAccounted(uint256 amount);
     event RevenueWithdrawedFromValidator(uint256 amount);
-    event ValidatorSlashedStopped(uint256 [] stoppedIDs, uint256 stoppedBalance);
+    event ValidatorSlashedStopped(uint256 stoppedCount, uint256 stoppedBalance);
     event ManagerAccountSet(address account);
     event ManagerFeeSet(uint256 milli);
     event ManagerFeeWithdrawed(uint256 amount, address);
