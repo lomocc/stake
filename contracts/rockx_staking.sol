@@ -236,6 +236,11 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         lastDebt = 0;
         phase = 0;
         _vectorClockTick();
+
+        // initiate default withdrawal credential to the contract itself
+        // uint8('0x1') + 11 bytes(0) + this.address
+        bytes memory cred = abi.encodePacked(bytes1(0x01), new bytes(11), address(this));
+        withdrawalCredentials = BytesLib.toBytes32(cred, 0);
     }
 
     /**
@@ -268,7 +273,7 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
 
         // mark old pub key to false
         bytes32 oldPubKeyHash = keccak256(oldpubkey);
-        require(pubkeyIndices[oldPubKeyHash] == 0, "PUBKEY_NOT_EXSITS");
+        require(pubkeyIndices[oldPubKeyHash] > 0, "PUBKEY_NOT_EXSITS");
         uint256 index = pubkeyIndices[oldPubKeyHash] - 1;
         delete pubkeyIndices[oldPubKeyHash];
 
@@ -354,10 +359,11 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
     function withdrawManagerFee(uint256 amount, address to) external nonReentrant onlyRole(MANAGER_ROLE)  {
         require(amount <= accountedManagerRevenue, "WITHDRAW_EXCEEDED_MANAGER_REVENUE");
         require(amount <= _currentEthersReceived(), "INSUFFICIENT_ETHERS");
-        payable(to).sendValue(amount);
+
         accountedBalance -= int256(amount);
-        // track manager's revenue
         accountedManagerRevenue -= amount;
+        payable(to).sendValue(amount);
+
         emit ManagerFeeWithdrawed(amount, to);
     }
 
@@ -395,11 +401,24 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         }
 
         // step 2. calc rewards, this also considers recentReceived ethers from 
-        // either stopped validators or withdrawed ethers as rewards, 
-        // revenue generated if:
-        //  current alive balance + ethers from validators + recent slashed>= reward base
-        // make sure we have revenue
-        require(_aliveBalance + recentReceived  + recentSlashed > rewardBase, "NOT_ENOUGH_REVENUE");
+        // either stopped validators or withdrawed ethers as rewards.
+        //
+        // During two consecutive pushBeacon operation, the ethers will ONLY: 
+        //  1. staked to new validators
+        //  2. move from active validators to this contract
+        //  3. slashed and stopped then the remaining ethers returned to this contract
+        // 
+        // so, at any time, revenue generated if:
+        //
+        //  current active validator balance 
+        //      + recent received from validators(since last pushBeacon) 
+        //      + recent slashed(since last pushBeacon)
+        //  >（GREATER THAN) reward base(last active validator balance + new nodes balance)
+        //
+        // NOTE(x): recentSlashed is accounted here, then we can adjust the basepoint to current alive validator balance.
+        // 
+
+        require(_aliveBalance + recentReceived + recentSlashed > rewardBase, "NOT_ENOUGH_REVENUE");
         uint256 rewards = _aliveBalance + recentReceived + recentSlashed - rewardBase;
         _distributeRewards(rewards);
 
@@ -425,7 +444,7 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         require(_stoppedPubKeys.length + stoppedValidators <= nextValidatorId, "REPORTED_MORE_STOPPED_VALIDATORS");
         require(_currentEthersReceived() >= _stoppedBalance, "INSUFFICIENT_ETHERS_PUSHED");
 
-        // record stopped validators snapshot.
+        // track stopped validators
         for (uint i=0;i<_stoppedPubKeys.length;i++) {
             bytes32 pubkeyHash = keccak256(_stoppedPubKeys[i]);
             require(pubkeyIndices[pubkeyHash] > 0, "PUBKEY_NOT_EXIST");
@@ -437,12 +456,14 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
 
         // NOTE(x) The following procedure MUST keep currentReserve unchanged:
         // 
-        // (totalPending + amountUnstaked - paid + rewardDebt) + (totalStaked - amountUnstaked) + accountedUserRevenue - rewardDebt - (totalDebts - paid)
+        // (totalPending + amountUnstaked - paid + incrRewardDebt) + (totalStaked - amountUnstaked) + accountedUserRevenue - (rewardDebt + incrRewardDebt) - (totalDebts - paid)
         //  ==
-        //  totalPending + totalStaked + accountedUserRevenue - totalDebts
+        //  totalPending + totalStaked + accountedUserRevenue - totalDebts - rewardDebt
         //
         
-        // extra value;
+        // Extra value, which is more than debt clearance requirements,
+        // will be re-staked.
+        // NOTE(x): I name this value to be rewardDebts
         uint256 incrRewardDebt = _stoppedBalance - amountUnstaked;
 
         // pay debts
@@ -459,6 +480,7 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
 
         // Variables Compaction
         // compact accountedUserRevenue & rewardDebt, to avert overflow
+        // NOTE(x): a good to have optimization.
         if (accountedUserRevenue >= rewardDebts) {
             accountedUserRevenue -= rewardDebts;
             rewardDebts = 0;
@@ -484,7 +506,7 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         require(_slashedAmount + _remainingAmount >= amountUnstaked);
         require(_currentEthersReceived() >= _remainingAmount, "INSUFFICIENT_ETHERS_PUSHED");
 
-        // record stopped validators snapshot.
+        // record slashed validators.
         for (uint i=0;i<_stoppedPubKeys.length;i++) {
             bytes32 pubkeyHash = keccak256(_stoppedPubKeys[i]);
             require(pubkeyIndices[pubkeyHash] > 0, "PUBKEY_NOT_EXIST");
@@ -666,12 +688,13 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
         uint256 totalXETH = IERC20(xETHAddress).totalSupply();
         uint256 totalEthers = currentReserve();
         uint256 toMint = 1 * msg.value;  // default exchange ratio 1:1
-        require(toMint >= minToMint, "EXCHANGE_RATIO_MISMATCH");
 
         if (totalEthers > 0) { // avert division overflow
             toMint = totalXETH * msg.value / totalEthers;
         }
+
         // mint xETH
+        require(toMint >= minToMint, "EXCHANGE_RATIO_MISMATCH");
         IMintableContract(xETHAddress).mint(msg.sender, toMint);
         totalPending += msg.value;
 
@@ -873,13 +896,10 @@ contract RockXStaking is Initializable, PausableUpgradeable, AccessControlUpgrad
     event ValidatorActivated(uint256 node_id);
     event ValidatorStopped(uint256 stoppedCount, uint256 stoppedBalance);
     event RevenueAccounted(uint256 amount);
-    event RevenueWithdrawedFromValidator(uint256 amount);
     event ValidatorSlashedStopped(uint256 stoppedCount, uint256 slashed);
     event ManagerAccountSet(address account);
     event ManagerFeeSet(uint256 milli);
     event ManagerFeeWithdrawed(uint256 amount, address);
-    event Redeemed(uint256 amountXETH, uint256 amountETH);
-    event RedeemFromValidator(uint256 amountXETH, uint256 amountETH);
     event WithdrawCredentialSet(bytes32 withdrawCredential);
     event DebtQueued(address creditor, uint256 amountEther);
     event XETHContractSet(address addr);
